@@ -2,28 +2,63 @@
 /**
  * Plugin Name: Salient Category Filter (WPBakery Element)
  * Description: Adds a category filter + AJAX post loop (shortcode + WPBakery element).
- * Version: 1.0.0
+ * Version: 1.0.1
  */
 
 if (!defined('ABSPATH')) exit;
 
-class SCF_Plugin {
+class SCF_Salient_Blog_Filter {
+  const QV = 'scf_cat';
+  const NONCE_ACTION = 'scf_blog_filter_nonce';
+
   private static $used = false;
-  const NONCE_ACTION = 'scf_nonce';
 
   public function __construct() {
-    add_action('init', [$this, 'register_shortcode']);
+    add_filter('query_vars', [$this, 'add_query_var']);
+    add_action('pre_get_posts', [$this, 'maybe_filter_main_query'], 20);
+
+    add_shortcode('scf_blog_filter', [$this, 'shortcode_filter_ui']);
+
     add_action('wp_enqueue_scripts', [$this, 'enqueue_assets']);
 
-    add_action('wp_ajax_scf_filter_posts', [$this, 'ajax_filter_posts']);
-    add_action('wp_ajax_nopriv_scf_filter_posts', [$this, 'ajax_filter_posts']);
-
-    // WPBakery element
-    add_action('vc_before_init', [$this, 'register_vc_element']);
+    // Optional: WPBakery element for the UI
+    add_action('vc_after_init', [$this, 'register_vc_element']);
   }
 
-  public function register_shortcode() {
-    add_shortcode('salient_category_filter', [$this, 'shortcode']);
+  public function add_query_var($vars) {
+    $vars[] = self::QV;
+    return $vars;
+  }
+
+  /**
+   * Adjust ONLY the main query on the target blog page.
+   * By default this targets is_home() (Posts page).
+   * If your blog is a normal Page with a Blog element, set page_id in shortcode/element.
+   */
+  public function maybe_filter_main_query($q) {
+    if (is_admin() || !$q->is_main_query()) return;
+
+    $cat = get_query_var(self::QV);
+    $cat = $cat ? (int) $cat : 0;
+    if ($cat <= 0) return;
+
+    // Determine which page is being filtered:
+    // Default: Posts page (is_home()).
+    // OR a specific page (when scf_page_id is present).
+    $target_page_id = isset($_GET['scf_page_id']) ? (int) $_GET['scf_page_id'] : 0;
+
+    $is_target = false;
+
+    if (is_home()) {
+      $is_target = true;
+    } elseif ($target_page_id > 0 && is_page($target_page_id)) {
+      $is_target = true;
+    }
+
+    if (!$is_target) return;
+
+    // Apply category constraint
+    $q->set('cat', $cat);
   }
 
   public function enqueue_assets() {
@@ -37,48 +72,40 @@ class SCF_Plugin {
       true
     );
 
-    wp_localize_script('scf-filter', 'SCF', [
-      'ajaxUrl' => admin_url('admin-ajax.php'),
-      'nonce'   => wp_create_nonce(self::NONCE_ACTION),
+    wp_localize_script('scf-filter', 'SCF_BLOG_FILTER', [
+      'nonce' => wp_create_nonce(self::NONCE_ACTION),
     ]);
 
     wp_enqueue_script('scf-filter');
-
-    wp_register_style(
-      'scf-style',
-      plugin_dir_url(__FILE__) . 'assets/scf-style.css',
-      [],
-      '1.0.0'
-    );
-
-    wp_enqueue_style('scf-style');
   }
 
-  public function shortcode($atts) {
+  public function shortcode_filter_ui($atts) {
     self::$used = true;
+
     $atts = shortcode_atts([
-      'posts_per_page' => 9,
       'taxonomy' => 'category',
-      'include' => '',       // comma IDs: 1,2,3
-      'exclude' => '',       // comma IDs: 1,2,3
-      'hide_empty' => 1,
-      'orderby' => 'name',
-      'order' => 'ASC',
-      'show_all' => 1,
+      'show_all' => '1',
       'all_label' => 'All',
-      'layout' => 'grid',    // grid|list
-    ], $atts, 'salient_category_filter');
+      'include' => '',  // term IDs: 1,2,3
+      'exclude' => '',  // term IDs: 1,2,3
+
+      // IMPORTANT: selector for the Salient blog container to replace.
+      // You must set this to a wrapper that contains the posts list.
+      'replace_selector' => '.blog-wrap',
+
+      // If your blog is a normal Page (not the Posts page),
+      // set this to that page ID so pre_get_posts knows when to filter.
+      'page_id' => '',
+    ], $atts, 'scf_blog_filter');
 
     $taxonomy = sanitize_key($atts['taxonomy']);
-    if (!taxonomy_exists($taxonomy)) return '<p>Taxonomy not found.</p>';
-
-    $uid = 'scf_' . wp_generate_uuid4();
+    if (!taxonomy_exists($taxonomy)) return '';
 
     $terms_args = [
       'taxonomy' => $taxonomy,
-      'hide_empty' => (bool) (int) $atts['hide_empty'],
-      'orderby' => sanitize_key($atts['orderby']),
-      'order' => sanitize_key($atts['order']) === 'DESC' ? 'DESC' : 'ASC',
+      'hide_empty' => true,
+      'orderby' => 'name',
+      'order' => 'ASC',
     ];
 
     if (!empty($atts['include'])) {
@@ -89,151 +116,65 @@ class SCF_Plugin {
     }
 
     $terms = get_terms($terms_args);
-    if (is_wp_error($terms)) return '<p>Could not load categories.</p>';
+    if (is_wp_error($terms) || empty($terms)) return '';
 
-    $posts_per_page = (int) $atts['posts_per_page'];
-    $layout = sanitize_key($atts['layout']);
-    $show_all = (int) $atts['show_all'];
-    $all_label = sanitize_text_field($atts['all_label']);
+    $page_id = (int) $atts['page_id'];
+    $replace_selector = (string) $atts['replace_selector'];
+
+    // Base URL should be the current page permalink
+    $base_url = is_singular() ? get_permalink() : home_url('/');
 
     ob_start(); ?>
-      <div class="salient-cat-filter" id="<?php echo esc_attr($uid); ?>"
-        data-posts-per-page="<?php echo esc_attr($posts_per_page); ?>"
-        data-taxonomy="<?php echo esc_attr($taxonomy); ?>"
-        data-layout="<?php echo esc_attr($layout); ?>">
+      <div class="scf-blog-filter-ui"
+           data-base-url="<?php echo esc_url($base_url); ?>"
+           data-replace-selector="<?php echo esc_attr($replace_selector); ?>"
+           data-page-id="<?php echo esc_attr($page_id); ?>">
 
-        <div class="salient-cat-filter__buttons">
-          <?php if ($show_all): ?>
-            <button class="scf-btn is-active" data-term-id="0" type="button"><?php echo esc_html($all_label); ?></button>
+        <div class="scf-blog-filter-ui__buttons">
+          <?php if ((int)$atts['show_all'] === 1): ?>
+            <button class="scf-btn is-active" type="button" data-cat="0"><?php echo esc_html($atts['all_label']); ?></button>
           <?php endif; ?>
 
-          <?php foreach ($terms as $term): ?>
-            <button class="scf-btn" data-term-id="<?php echo (int) $term->term_id; ?>" type="button">
-              <?php echo esc_html($term->name); ?>
+          <?php foreach ($terms as $t): ?>
+            <button class="scf-btn" type="button" data-cat="<?php echo (int)$t->term_id; ?>">
+              <?php echo esc_html($t->name); ?>
             </button>
           <?php endforeach; ?>
         </div>
 
-        <div class="salient-cat-filter__results">
-          <?php echo $this->render_posts_html([
-            'term_id' => 0,
-            'taxonomy' => $taxonomy,
-            'posts_per_page' => $posts_per_page,
-            'layout' => $layout,
-            'paged' => 1,
-          ]); ?>
-        </div>
       </div>
     <?php
     return ob_get_clean();
-  }
-
-  private function render_posts_html($args) {
-    $term_id = (int) ($args['term_id'] ?? 0);
-    $taxonomy = sanitize_key($args['taxonomy'] ?? 'category');
-    $posts_per_page = (int) ($args['posts_per_page'] ?? 9);
-    $layout = sanitize_key($args['layout'] ?? 'grid');
-    $paged = max(1, (int) ($args['paged'] ?? 1));
-
-    $query_args = [
-      'post_type' => 'post',
-      'post_status' => 'publish',
-      'posts_per_page' => $posts_per_page,
-      'paged' => $paged,
-      'ignore_sticky_posts' => true,
-    ];
-
-    if ($term_id > 0) {
-      $query_args['tax_query'] = [[
-        'taxonomy' => $taxonomy,
-        'field' => 'term_id',
-        'terms' => [$term_id],
-      ]];
-    }
-
-    $q = new WP_Query($query_args);
-
-    ob_start();
-
-    if ($q->have_posts()) {
-      echo '<div class="scf-posts scf-layout-' . esc_attr($layout) . '">';
-      while ($q->have_posts()) {
-        $q->the_post();
-        echo '<article class="scf-post">';
-          if (has_post_thumbnail()) {
-            echo '<a class="scf-thumb" href="' . esc_url(get_permalink()) . '">';
-            the_post_thumbnail('medium_large');
-            echo '</a>';
-          }
-          echo '<h3 class="scf-title"><a href="' . esc_url(get_permalink()) . '">' . esc_html(get_the_title()) . '</a></h3>';
-          echo '<div class="scf-excerpt">' . esc_html(wp_strip_all_tags(get_the_excerpt())) . '</div>';
-        echo '</article>';
-      }
-      echo '</div>';
-    } else {
-      echo '<p>No posts found.</p>';
-    }
-
-    wp_reset_postdata();
-    return ob_get_clean();
-  }
-
-  public function ajax_filter_posts() {
-    check_ajax_referer(self::NONCE_ACTION, 'nonce');
-
-    $term_id = isset($_POST['term_id']) ? (int) $_POST['term_id'] : 0;
-    $taxonomy = isset($_POST['taxonomy']) ? sanitize_key($_POST['taxonomy']) : 'category';
-    $posts_per_page = isset($_POST['posts_per_page']) ? (int) $_POST['posts_per_page'] : 9;
-    $layout = isset($_POST['layout']) ? sanitize_key($_POST['layout']) : 'grid';
-    $paged = isset($_POST['paged']) ? max(1, (int) $_POST['paged']) : 1;
-
-    if (!taxonomy_exists($taxonomy)) {
-      wp_send_json_error(['message' => 'Invalid taxonomy.'], 400);
-    }
-
-    $html = $this->render_posts_html([
-      'term_id' => $term_id,
-      'taxonomy' => $taxonomy,
-      'posts_per_page' => $posts_per_page,
-      'layout' => $layout,
-      'paged' => $paged,
-    ]);
-
-    wp_send_json_success(['html' => $html]);
   }
 
   public function register_vc_element() {
     if (!defined('WPB_VC_VERSION') || !function_exists('vc_map')) return;
 
     vc_map([
-      'name' => 'Category Filter (AJAX)',
-      'base' => 'salient_category_filter',
+      'name' => 'Blog Category Filter (Salient)',
+      'base' => 'scf_blog_filter',
       'category' => 'Content',
-      'description' => 'Filter posts by category without leaving the page.',
+      'description' => 'Filters Salient blog output on the same page.',
       'params' => [
         [
           'type' => 'textfield',
-          'heading' => 'Posts per page',
-          'param_name' => 'posts_per_page',
-          'value' => '9',
+          'heading' => 'Replace selector (required)',
+          'param_name' => 'replace_selector',
+          'value' => '.blog-wrap',
+          'description' => 'CSS selector of the Salient blog container to replace (inspect your blog area). Example: .blog-wrap or .posts-container',
         ],
         [
-          'type' => 'dropdown',
-          'heading' => 'Taxonomy',
-          'param_name' => 'taxonomy',
-          'value' => [
-            'Category' => 'category',
-            'Post Tag' => 'post_tag',
-          ],
+          'type' => 'textfield',
+          'heading' => 'Blog Page ID (only if NOT using Posts page)',
+          'param_name' => 'page_id',
+          'value' => '',
+          'description' => 'If your blog is a normal Page with a Blog element, enter that page ID. If you use the Posts page, leave blank.',
         ],
         [
-          'type' => 'dropdown',
-          'heading' => 'Layout',
-          'param_name' => 'layout',
-          'value' => [
-            'Grid' => 'grid',
-            'List' => 'list',
-          ],
+          'type' => 'textfield',
+          'heading' => '"All" label',
+          'param_name' => 'all_label',
+          'value' => 'All',
         ],
         [
           'type' => 'checkbox',
@@ -244,30 +185,23 @@ class SCF_Plugin {
         ],
         [
           'type' => 'textfield',
-          'heading' => '"All" label',
-          'param_name' => 'all_label',
-          'value' => 'All',
-          'dependency' => ['element' => 'show_all', 'value' => '1'],
-        ],
-        [
-          'type' => 'textfield',
           'heading' => 'Include term IDs',
           'param_name' => 'include',
-          'description' => 'Comma-separated term IDs (example: 12,14,22). Leave blank for all.',
+          'description' => 'Comma-separated category IDs to include.',
         ],
         [
           'type' => 'textfield',
           'heading' => 'Exclude term IDs',
           'param_name' => 'exclude',
-          'description' => 'Comma-separated term IDs to exclude.',
+          'description' => 'Comma-separated category IDs to exclude.',
         ],
       ],
     ]);
+
+    if (class_exists('WPBakeryShortCode')) {
+      class WPBakeryShortCode_scf_blog_filter extends WPBakeryShortCode {}
+    }
   }
 }
 
-new SCF_Plugin();
-
-if (class_exists('WPBakeryShortCode')) {
-  class WPBakeryShortCode_salient_category_filter extends WPBakeryShortCode {}
-}
+new SCF_Salient_Blog_Filter();
