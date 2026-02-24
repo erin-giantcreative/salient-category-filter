@@ -2,19 +2,12 @@
   display: flex;
   flex-wrap: wrap;
   gap: 10px;
-  margin-bottom: 18px;
 }
 
 .scf-btn {
-  border: 1px solid rgba(0,0,0,.15);
-  padding: 8px 12px;
-  background: transparent;
   cursor: pointer;
-  border-radius: 6px;
-}
-
-.scf-btn.is-active {
-  font-weight: 700;
+  border: none;
+  background: none;
 }
 
 .scf-posts.scf-layout-grid {
@@ -30,6 +23,7 @@
   .scf-posts.scf-layout-grid { grid-template-columns: 1fr; }
 }
 
-.scf-post .scf-title {
-  margin: 10px 0 6px;
+.scf-blog-filter-ui.is-loading {
+  pointer-events: none;
+  opacity: 0.6;
 }
