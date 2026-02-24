@@ -203,14 +203,13 @@ class SCF_Plugin {
   }
 
   public function register_vc_element() {
-    if (!function_exists('vc_map')) return;
+    if (!defined('WPB_VC_VERSION') || !function_exists('vc_map')) return;
 
     vc_map([
       'name' => 'Category Filter (AJAX)',
       'base' => 'salient_category_filter',
       'category' => 'Content',
       'description' => 'Filter posts by category without leaving the page.',
-      'js_view' => 'VcBackendTtaTabsView',
       'params' => [
         [
           'type' => 'textfield',
@@ -268,3 +267,7 @@ class SCF_Plugin {
 }
 
 new SCF_Plugin();
+
+if (class_exists('WPBakeryShortCode')) {
+  class WPBakeryShortCode_salient_category_filter extends WPBakeryShortCode {}
+}
