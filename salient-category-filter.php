@@ -197,11 +197,11 @@ class SCF_Salient_Blog_Filter {
         ],
       ],
     ]);
-
-    if (class_exists('WPBakeryShortCode')) {
-      class WPBakeryShortCode_scf_blog_filter extends WPBakeryShortCode {}
-    }
   }
 }
 
 new SCF_Salient_Blog_Filter();
+
+if (class_exists('WPBakeryShortCode')) {
+  class WPBakeryShortCode_scf_blog_filter extends WPBakeryShortCode {}
+}
