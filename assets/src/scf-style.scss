@@ -1,0 +1,58 @@
+// Salient Category Filter — component styles
+// Source: assets/src/scf-style.scss
+// Built by gulp → assets/scf-style.css
+
+.scf-blog-filter-ui__buttons {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.scf-btn {
+  cursor: pointer;
+  border: none;
+  background: none;
+
+  &:focus-visible {
+    outline: 2px solid currentColor;
+    outline-offset: 2px;
+  }
+
+  // Non-colour indicator for active state (WCAG 1.4.1)
+  &.is-active {
+    font-weight: bold;
+    text-decoration: underline;
+  }
+}
+
+// Visually hidden live region
+.scf-live-status {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+.scf-posts.scf-layout-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 20px;
+
+  @media (max-width: 999px) {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  @media (max-width: 690px) {
+    grid-template-columns: 1fr;
+  }
+}
+
+.scf-blog-filter-ui.is-loading {
+  pointer-events: none;
+  opacity: 0.6;
+}

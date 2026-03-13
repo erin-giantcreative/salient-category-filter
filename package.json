@@ -1,0 +1,23 @@
+{
+  "name": "salient-category-filter",
+  "version": "1.0.2",
+  "description": "Build tooling for salient-category-filter WordPress plugin",
+  "private": true,
+  "scripts": {
+    "build": "gulp build",
+    "watch": "gulp watch"
+  },
+  "devDependencies": {
+    "autoprefixer": "^10.4.17",
+    "cssnano": "^6.0.3",
+    "gulp": "^4.0.2",
+    "gulp-imagemin": "^7.1.0",
+    "gulp-postcss": "^9.1.0",
+    "gulp-rename": "^2.0.0",
+    "gulp-sass": "^5.1.0",
+    "gulp-sourcemaps": "^3.0.0",
+    "gulp-terser": "^2.1.0",
+    "postcss": "^8.5.8",
+    "sass": "^1.71.0"
+  }
+}

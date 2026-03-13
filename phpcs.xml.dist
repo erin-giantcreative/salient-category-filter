@@ -1,0 +1,48 @@
+<?xml version="1.0"?>
+<ruleset name="Salient Category Filter">
+    <description>PHPCS configuration for the Salient Category Filter plugin.</description>
+
+    <!-- PHP source only; JS/SCSS are handled by the Gulp build pipeline. -->
+    <file>salient-category-filter.php</file>
+    <arg name="extensions" value="php"/>
+
+    <arg name="basepath" value="."/>
+    <arg name="colors"/>
+    <arg value="sp"/>
+
+    <rule ref="WordPress"/>
+
+    <!--
+        The plugin's main file is named after the plugin (WordPress convention)
+        not the class it contains. The class-naming rule is excluded for this file.
+    -->
+    <rule ref="WordPress.Files.FileName.InvalidClassFileName">
+        <exclude-pattern>salient-category-filter.php</exclude-pattern>
+    </rule>
+
+    <!--
+        WPBakery requires extending WPBakeryShortCode with a class whose name
+        matches the shortcode base exactly: WPBakeryShortCode_{base}. The
+        class-name, multi-structure, and mixed-declarations rules cannot be
+        satisfied without breaking WPBakery or WordPress plugin conventions.
+    -->
+    <rule ref="Generic.Files.OneObjectStructurePerFile">
+        <exclude-pattern>salient-category-filter.php</exclude-pattern>
+    </rule>
+    <rule ref="Universal.Files.SeparateFunctionsFromOO">
+        <exclude-pattern>salient-category-filter.php</exclude-pattern>
+    </rule>
+    <rule ref="WordPress.Files.FileName.NotHyphenatedLowercase">
+        <exclude-pattern>salient-category-filter.php</exclude-pattern>
+    </rule>
+    <rule ref="PEAR.NamingConventions.ValidClassName">
+        <exclude-pattern>salient-category-filter.php</exclude-pattern>
+    </rule>
+    <rule ref="Squiz.Commenting.ClassComment">
+        <exclude-pattern>salient-category-filter.php</exclude-pattern>
+    </rule>
+
+    <!-- Minimum PHP version supported by this plugin. -->
+    <config name="minimum_supported_wp_version" value="6.0"/>
+    <config name="testVersion" value="7.4-"/>
+</ruleset>
