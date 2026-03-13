@@ -1,0 +1,41 @@
+# OS files
+.DS_Store
+Thumbs.db
+
+# Node
+node_modules/
+npm-debug.log*
+yarn-error.log
+
+# Composer
+vendor/
+composer.lock
+
+# Build output
+dist/
+build/
+public/build/
+public/assets/
+
+
+# Logs
+*.log
+
+# Env files
+.env
+.env.*
+
+# Editor files
+*.swp
+.idea/
+.vscode/
+
+# cPanel backups
+backup-*/
+tmp/
+
+# Dev artifacts
+*.md
+
+# Ralph Loop state (local only, never commit)
+.claude/

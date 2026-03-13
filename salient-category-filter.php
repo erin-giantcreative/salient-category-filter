@@ -3,362 +3,660 @@
  * Plugin Name: Salient Category Filter (WPBakery Element)
  * Description: Adds a category filter + AJAX post loop (shortcode + WPBakery element).
  * Version: 1.0.2
+ * Text Domain: salient-category-filter
+ *
+ * @package Salient_Category_Filter
  */
 
-if (!defined('ABSPATH')) exit;
+if ( ! defined( 'ABSPATH' ) ) {
+	exit;
+}
 
+define( 'SCF_VERSION', '1.0.2' );
+
+/**
+ * Main plugin class.
+ *
+ * Registers the shortcode, REST endpoint, legacy AJAX handler, WPBakery element,
+ * asset enqueueing, and transient cache management for the Salient category filter.
+ *
+ * @package Salient_Category_Filter
+ */
 class SCF_Salient_Blog_Filter {
-  const QV = 'category';
-  const NONCE_ACTION = 'scf_blog_filter_nonce';
 
-  // Cache settings
-  const HTML_CACHE_TTL = 300;   // 5 minutes
-  const TERMS_CACHE_TTL = 3600; // 1 hour
-  const CACHE_GROUP = 'scf_blog_filter';
+	const QV           = 'category';
+	const NONCE_ACTION = 'scf_blog_filter_nonce';
 
-  public function __construct() {
-    add_filter('query_vars', [$this, 'add_query_var']);
-    add_action('pre_get_posts', [$this, 'maybe_filter_main_query'], 20);
+	/**
+	 * Transient TTL for cached HTML fragments (seconds).
+	 */
+	const HTML_CACHE_TTL = 300;
 
-    add_shortcode('scf_blog_filter', [$this, 'shortcode_filter_ui']);
+	/**
+	 * Transient TTL for cached term lists (seconds).
+	 */
+	const TERMS_CACHE_TTL = 3600;
 
-    add_action('wp_enqueue_scripts', [$this, 'register_assets']);
+	/**
+	 * Register all WordPress hooks.
+	 */
+	public function __construct() {
+		add_filter( 'query_vars', array( $this, 'add_query_var' ) );
+		add_action( 'pre_get_posts', array( $this, 'maybe_filter_main_query' ), 20 );
 
-    // AJAX endpoint returns ONLY blog HTML
-    add_action('wp_ajax_scf_get_blog_html', [$this, 'ajax_get_blog_html']);
-    add_action('wp_ajax_nopriv_scf_get_blog_html', [$this, 'ajax_get_blog_html']);
+		add_shortcode( 'scf_blog_filter', array( $this, 'shortcode_filter_ui' ) );
 
-    // Optional: WPBakery element for the UI
-    add_action('vc_after_init', [$this, 'register_vc_element']);
+		add_action( 'wp_enqueue_scripts', array( $this, 'register_assets' ) );
 
-    // Bust caches when content changes
-    add_action('save_post_post', [$this, 'bust_all_cache']);
-    add_action('deleted_post', [$this, 'bust_all_cache']);
-    add_action('created_category', [$this, 'bust_all_cache']);
-    add_action('edited_category', [$this, 'bust_all_cache']);
-    add_action('delete_category', [$this, 'bust_all_cache']);
-  }
+		// Primary endpoint: REST API (lighter bootstrap than admin-ajax.php, cacheable by CDN).
+		add_action( 'rest_api_init', array( $this, 'register_rest_routes' ) );
 
-  public function add_query_var($vars) {
-    $vars[] = self::QV;
-    return $vars;
-  }
+		// Legacy AJAX endpoint kept for backwards compatibility with any cached JS.
+		add_action( 'wp_ajax_scf_get_blog_html', array( $this, 'ajax_get_blog_html' ) );
+		add_action( 'wp_ajax_nopriv_scf_get_blog_html', array( $this, 'ajax_get_blog_html' ) );
 
-  public function maybe_filter_main_query($q) {
-    if (is_admin() || !$q->is_main_query()) return;
+		// Add defer attribute to the filter script.
+		add_filter( 'script_loader_tag', array( $this, 'add_defer_to_script' ), 10, 2 );
 
-    $cat = get_query_var(self::QV);
-    $cat = $cat ? (int) $cat : 0;
-    if ($cat <= 0) return;
+		// Optional: WPBakery element.
+		add_action( 'vc_after_init', array( $this, 'register_vc_element' ) );
 
-    $target_page_id = isset($_GET['scf_page_id']) ? (int) $_GET['scf_page_id'] : 0;
+		// Bust caches when content changes.
+		add_action( 'save_post_post', array( $this, 'bust_all_cache' ) );
+		add_action( 'deleted_post', array( $this, 'bust_all_cache' ) );
+		add_action( 'created_category', array( $this, 'bust_all_cache' ) );
+		add_action( 'edited_category', array( $this, 'bust_all_cache' ) );
+		add_action( 'delete_category', array( $this, 'bust_all_cache' ) );
+	}
 
-    $is_target = false;
-    if (is_home()) {
-      $is_target = true;
-    } elseif ($target_page_id > 0 && is_page($target_page_id)) {
-      $is_target = true;
-    }
+	// -------------------------------------------------------------------------
+	// Query / routing.
+	// -------------------------------------------------------------------------
 
-    if (!$is_target) return;
+	/**
+	 * Register the category query var so WordPress passes it through.
+	 *
+	 * @param array $vars Existing public query vars.
+	 * @return array
+	 */
+	public function add_query_var( $vars ) {
+		$vars[] = self::QV;
+		return $vars;
+	}
 
-    $q->set('cat', $cat);
-  }
+	/**
+	 * Apply the category filter to the main query when the correct page is loaded.
+	 *
+	 * The scf_page_id parameter is an internal plugin parameter appended by the
+	 * loopback request; nonce verification is intentionally omitted here because
+	 * this fires on pre_get_posts (before any form submission).
+	 *
+	 * @param WP_Query $q The current query object.
+	 */
+	public function maybe_filter_main_query( $q ) {
+		if ( is_admin() || ! $q->is_main_query() ) {
+			return;
+		}
 
-  public function register_assets() {
-    wp_register_script(
-      'scf-salient-blog-filter',
-      plugin_dir_url(__FILE__) . 'assets/scf-filter.js',
-      ['jquery'],
-      '1.0.2',
-      true
-    );
+		$cat = get_query_var( self::QV );
+		$cat = $cat ? (int) $cat : 0;
+		if ( $cat <= 0 ) {
+			return;
+		}
 
-    wp_localize_script('scf-salient-blog-filter', 'SCF_BLOG_FILTER', [
-      'ajaxUrl' => admin_url('admin-ajax.php'),
-      'nonce'   => wp_create_nonce(self::NONCE_ACTION),
-    ]);
+		// phpcs:ignore WordPress.Security.NonceVerification.Recommended
+		$target_page_id = isset( $_GET['scf_page_id'] ) ? (int) $_GET['scf_page_id'] : 0;
 
-    wp_register_style(
-      'scf-salient-blog-filter',
-      plugin_dir_url(__FILE__) . 'assets/scf-style.css',
-      [],
-      '1.0.2'
-    );
-  }
+		$is_target = false;
+		if ( is_home() ) {
+			$is_target = true;
+		} elseif ( $target_page_id > 0 && is_page( $target_page_id ) ) {
+			$is_target = true;
+		}
 
-  private function get_terms_cached($taxonomy, $include_csv, $exclude_csv) {
-    $key = 'scf_terms_' . md5(serialize([$taxonomy, $include_csv, $exclude_csv]));
-    $cached = get_transient($key);
-    if ($cached !== false) return $cached;
+		if ( ! $is_target ) {
+			return;
+		}
 
-    $terms_args = [
-      'taxonomy' => $taxonomy,
-      'hide_empty' => true,
-      'orderby' => 'name',
-      'order' => 'ASC',
-    ];
+		$q->set( 'cat', $cat );
+	}
 
-    if (!empty($include_csv)) {
-      $terms_args['include'] = array_map('intval', array_filter(array_map('trim', explode(',', $include_csv))));
-    }
-    if (!empty($exclude_csv)) {
-      $terms_args['exclude'] = array_map('intval', array_filter(array_map('trim', explode(',', $exclude_csv))));
-    }
+	// -------------------------------------------------------------------------
+	// Asset registration.
+	// -------------------------------------------------------------------------
 
-    $terms = get_terms($terms_args);
-    if (is_wp_error($terms) || empty($terms)) {
-      set_transient($key, [], 300);
-      return [];
-    }
+	/**
+	 * Register (but do not enqueue) the plugin script and style.
+	 *
+	 * Assets are enqueued on demand inside shortcode_filter_ui() so they only
+	 * load on pages where the shortcode is present.
+	 */
+	public function register_assets() {
+		wp_register_script(
+			'scf-salient-blog-filter',
+			plugin_dir_url( __FILE__ ) . 'assets/scf-filter.js',
+			array( 'jquery' ),
+			SCF_VERSION,
+			true // Load in footer.
+		);
 
-    set_transient($key, $terms, self::TERMS_CACHE_TTL);
-    return $terms;
-  }
+		wp_localize_script(
+			'scf-salient-blog-filter',
+			'SCF_BLOG_FILTER',
+			array(
+				'restUrl' => rest_url( 'scf/v1/blog-html' ),
+				// Legacy fields so cached JS still works via admin-ajax fallback.
+				'ajaxUrl' => admin_url( 'admin-ajax.php' ),
+				'nonce'   => wp_create_nonce( self::NONCE_ACTION ),
+			)
+		);
 
-  private function get_blog_base_url($page_id) {
-    if (is_home()) {
-      $posts_page_id = (int) get_option('page_for_posts');
-      return $posts_page_id ? get_permalink($posts_page_id) : home_url('/');
-    }
-    if (is_page()) {
-      return get_permalink(get_queried_object_id());
-    }
-    if (!empty($page_id)) {
-      return get_permalink((int)$page_id);
-    }
-    return home_url('/');
-  }
+		wp_register_style(
+			'scf-salient-blog-filter',
+			plugin_dir_url( __FILE__ ) . 'assets/scf-style.css',
+			array(),
+			SCF_VERSION
+		);
+	}
 
-  public function shortcode_filter_ui($atts) {
-    wp_enqueue_script('scf-salient-blog-filter');
-    wp_enqueue_style('scf-salient-blog-filter');
+	/**
+	 * Add defer attribute to the filter script so it is non-blocking.
+	 *
+	 * Footer loading already prevents render-blocking; defer is belt-and-suspenders.
+	 *
+	 * @param string $tag    Script HTML tag.
+	 * @param string $handle Script handle.
+	 * @return string
+	 */
+	public function add_defer_to_script( $tag, $handle ) {
+		if ( 'scf-salient-blog-filter' === $handle ) {
+			return str_replace( ' src=', ' defer src=', $tag );
+		}
+		return $tag;
+	}
 
-    $atts = shortcode_atts([
-      'taxonomy' => 'category',
-      'show_all' => '1',
-      'all_label' => 'All',
-      'include' => '',
-      'exclude' => '',
-      'replace_selector' => '.blog-wrap',
-      'page_id' => '',
-    ], $atts, 'scf_blog_filter');
+	// -------------------------------------------------------------------------
+	// REST API endpoint.
+	// -------------------------------------------------------------------------
 
-    $taxonomy = sanitize_key($atts['taxonomy']);
-    if (!taxonomy_exists($taxonomy)) return '';
+	/**
+	 * Register the REST API route for blog HTML retrieval.
+	 */
+	public function register_rest_routes() {
+		register_rest_route(
+			'scf/v1',
+			'/blog-html',
+			array(
+				'methods'             => WP_REST_Server::READABLE,
+				'callback'            => array( $this, 'rest_get_blog_html' ),
+				'permission_callback' => '__return_true',
+				'args'                => array(
+					'base_url'         => array(
+						'required'          => true,
+						'sanitize_callback' => 'esc_url_raw',
+					),
+					'replace_selector' => array(
+						'required'          => true,
+						'sanitize_callback' => 'sanitize_text_field',
+					),
+					'cat_id'           => array(
+						'default'           => 0,
+						'sanitize_callback' => 'absint',
+					),
+					'page_id'          => array(
+						'default'           => 0,
+						'sanitize_callback' => 'absint',
+					),
+				),
+			)
+		);
+	}
 
-    $page_id = (int) $atts['page_id'];
-    $replace_selector = (string) $atts['replace_selector'];
+	/**
+	 * REST API callback: return the filtered blog HTML fragment.
+	 *
+	 * @param WP_REST_Request $request The REST request object.
+	 * @return WP_REST_Response|WP_Error
+	 */
+	public function rest_get_blog_html( WP_REST_Request $request ) {
+		$base_url         = $request->get_param( 'base_url' );
+		$replace_selector = $request->get_param( 'replace_selector' );
+		$cat_id           = (int) $request->get_param( 'cat_id' );
+		$page_id          = (int) $request->get_param( 'page_id' );
 
-    $terms = $this->get_terms_cached($taxonomy, $atts['include'], $atts['exclude']);
-    if (empty($terms)) return '';
+		$result = $this->fetch_blog_html_data( $base_url, $replace_selector, $cat_id, $page_id );
 
-    $base_url = $this->get_blog_base_url($page_id);
+		if ( is_wp_error( $result ) ) {
+			$data   = $result->get_error_data();
+			$status = is_array( $data ) && isset( $data['status'] ) ? (int) $data['status'] : 500;
+			return new WP_REST_Response( array( 'message' => $result->get_error_message() ), $status );
+		}
 
-    ob_start(); ?>
-      <div class="scf-blog-filter-ui"
-           data-base-url="<?php echo esc_url($base_url); ?>"
-           data-replace-selector="<?php echo esc_attr($replace_selector); ?>"
-           data-page-id="<?php echo esc_attr($page_id); ?>">
+		return rest_ensure_response( $result );
+	}
 
+	// -------------------------------------------------------------------------
+	// Legacy admin-ajax endpoint.
+	// -------------------------------------------------------------------------
 
-        <div class="scf-blog-filter-ui__buttons">
-          <span>FILTER BY:</span>
-          <?php if ((int)$atts['show_all'] === 1): ?>
-            <button class="scf-btn is-active" type="button" data-cat="0"><?php echo esc_html($atts['all_label']); ?></button>
-          <?php endif; ?>
+	/**
+	 * Legacy admin-ajax handler kept for backwards compatibility.
+	 *
+	 * Verifies the SCF nonce then delegates to fetch_blog_html_data().
+	 */
+	public function ajax_get_blog_html() {
+		check_ajax_referer( self::NONCE_ACTION, 'nonce' );
 
-          <?php foreach ($terms as $t): ?>
-            <button class="scf-btn" type="button" data-cat="<?php echo (int)$t->term_id; ?>">
-              <?php echo esc_html($t->name); ?>
-            </button>
-          <?php endforeach; ?>
-        </div>
+		$base_url         = isset( $_POST['base_url'] ) ? esc_url_raw( wp_unslash( $_POST['base_url'] ) ) : '';
+		$replace_selector = isset( $_POST['replace_selector'] ) ? sanitize_text_field( wp_unslash( $_POST['replace_selector'] ) ) : '';
+		$cat_id           = isset( $_POST['cat_id'] ) ? (int) $_POST['cat_id'] : 0;
+		$page_id          = isset( $_POST['page_id'] ) ? (int) $_POST['page_id'] : 0;
 
-      </div>
-    <?php
-    return ob_get_clean();
-  }
+		$result = $this->fetch_blog_html_data( $base_url, $replace_selector, $cat_id, $page_id );
 
-  /**
-   * AJAX: returns the HTML of replace_selector from the target blog page,
-   * with scf_cat applied via query var and pre_get_posts hook.
-   */
-  public function ajax_get_blog_html() {
-    check_ajax_referer(self::NONCE_ACTION, 'nonce');
+		if ( is_wp_error( $result ) ) {
+			$data   = $result->get_error_data();
+			$status = is_array( $data ) && isset( $data['status'] ) ? (int) $data['status'] : 500;
+			wp_send_json_error( array( 'message' => $result->get_error_message() ), $status );
+		}
 
-    $base_url = isset($_POST['base_url']) ? esc_url_raw($_POST['base_url']) : '';
-    $replace_selector = isset($_POST['replace_selector']) ? sanitize_text_field($_POST['replace_selector']) : '';
-    $cat_id = isset($_POST['cat_id']) ? (int) $_POST['cat_id'] : 0;
-    $page_id = isset($_POST['page_id']) ? (int) $_POST['page_id'] : 0;
+		wp_send_json_success( $result );
+	}
 
-    if (!$base_url || !$replace_selector) {
-      wp_send_json_error(['message' => 'Missing base_url or replace_selector.'], 400);
-    }
+	// -------------------------------------------------------------------------
+	// Shared blog-HTML fetch logic.
+	// -------------------------------------------------------------------------
 
-    // Cache key includes URL + selector + cat
-    $cache_key = 'scf_html_' . md5(serialize([$base_url, $replace_selector, $cat_id, $page_id]));
-    $cached = get_transient($cache_key);
-    if ($cached !== false) {
-      wp_send_json_success(['html' => $cached, 'cached' => true]);
-    }
+	/**
+	 * Validates params, checks the transient cache, performs the loopback HTTP
+	 * request, extracts the requested HTML fragment, and stores the result.
+	 *
+	 * @param string $base_url         The blog page URL.
+	 * @param string $replace_selector CSS selector whose inner HTML to extract.
+	 * @param int    $cat_id           Category term ID (0 = all).
+	 * @param int    $page_id          Page ID for same-page blog (0 = posts page).
+	 * @return array{html: string, cached: bool}|WP_Error
+	 */
+	private function fetch_blog_html_data( $base_url, $replace_selector, $cat_id, $page_id ) {
+		if ( ! $base_url || ! $replace_selector ) {
+			return new WP_Error( 'missing_params', 'Missing base_url or replace_selector.', array( 'status' => 400 ) );
+		}
 
-    // Build request URL with filter state
-    $url = add_query_arg([], $base_url);
+		// SSRF protection: only allow same-origin requests.
+		$home_host = wp_parse_url( home_url(), PHP_URL_HOST );
+		$req_host  = wp_parse_url( $base_url, PHP_URL_HOST );
+		if ( ! $req_host || $req_host !== $home_host ) {
+			return new WP_Error( 'invalid_url', 'base_url must be same origin.', array( 'status' => 400 ) );
+		}
 
-    if ($cat_id > 0) {
-      $url = add_query_arg(self::QV, $cat_id, $url);
-    } else {
-      // Ensure not present
-      $url = remove_query_arg(self::QV, $url);
-    }
+		// Cache key incorporates bust version so stale entries are ignored on content changes.
+		$cache_key = 'scf_html_v' . $this->cache_version()
+		. '_' . absint( $cat_id )
+		. '_p' . absint( $page_id )
+		. '_' . md5( $base_url . $replace_selector );
 
-    if ($page_id > 0) {
-      $url = add_query_arg('scf_page_id', $page_id, $url);
-    } else {
-      $url = remove_query_arg('scf_page_id', $url);
-    }
+		$cached = get_transient( $cache_key );
+		if ( false !== $cached ) {
+			return array(
+				'html'   => $cached,
+				'cached' => true,
+			);
+		}
 
-    // Fetch HTML from the blog page (same server) - much smaller than browser full-page parsing
-    $resp = wp_remote_get($url, [
-      'timeout'     => 10,
-      'sslverify'   => false,   // <-- key fix for self-signed cert
-      'httpversion' => '1.1',
-      'headers'     => [
-        'X-SCF-Request' => '1',
-      ],
-    ]);
+		// Build the loopback URL with filter state.
+		$url = add_query_arg( array(), $base_url );
 
-    if (is_wp_error($resp)) {
-      wp_send_json_error(['message' => $resp->get_error_message()], 500);
-    }
+		if ( $cat_id > 0 ) {
+			$url = add_query_arg( self::QV, $cat_id, $url );
+		} else {
+			$url = remove_query_arg( self::QV, $url );
+		}
 
-    $body = wp_remote_retrieve_body($resp);
-    if (!$body) {
-      wp_send_json_error(['message' => 'Empty response body.'], 500);
-    }
+		if ( $page_id > 0 ) {
+			$url = add_query_arg( 'scf_page_id', $page_id, $url );
+		} else {
+			$url = remove_query_arg( 'scf_page_id', $url );
+		}
 
-    // Extract only the requested selector block
-    $extracted = $this->extract_selector_html($body, $replace_selector);
+		$resp = wp_remote_get(
+			$url,
+			array(
+				'timeout'     => 10,
+				'sslverify'   => ! ( defined( 'WP_DEBUG' ) && WP_DEBUG ),
+				'httpversion' => '1.1',
+				'headers'     => array( 'X-SCF-Request' => '1' ),
+			)
+		);
 
-    if (!$extracted) {
-      // If selector fails, return a helpful error
-      wp_send_json_error([
-        'message' => 'Could not find replace_selector in response HTML.',
-        'selector' => $replace_selector,
-      ], 422);
-    }
+		if ( is_wp_error( $resp ) ) {
+			return new WP_Error( 'http_error', $resp->get_error_message(), array( 'status' => 500 ) );
+		}
 
-    set_transient($cache_key, $extracted, self::HTML_CACHE_TTL);
+		$body = wp_remote_retrieve_body( $resp );
+		if ( ! $body ) {
+			return new WP_Error( 'empty_body', 'Empty response body.', array( 'status' => 500 ) );
+		}
 
-    wp_send_json_success(['html' => $extracted, 'cached' => false]);
-  }
+		$extracted = $this->extract_selector_html( $body, $replace_selector );
+		if ( ! $extracted ) {
+			return new WP_Error(
+				'selector_not_found',
+				'Could not find replace_selector in response HTML.',
+				array(
+					'status'   => 422,
+					'selector' => $replace_selector,
+				)
+			);
+		}
 
-  /**
-   * Extract HTML for a CSS class selector like ".blog-wrap" or an ID selector "#something".
-   * This is intentionally limited to keep it safe/fast.
-   */
-  private function extract_selector_html($html, $selector) {
-    $selector = trim($selector);
+		set_transient( $cache_key, $extracted, self::HTML_CACHE_TTL );
 
-    // Only allow simple ".class" or "#id" selectors for this extractor.
-    if (!preg_match('/^([.#])([A-Za-z0-9_-]+)$/', $selector, $m)) {
-      return '';
-    }
+		return array(
+			'html'   => $extracted,
+			'cached' => false,
+		);
+	}
 
-    $type = $m[1];
-    $name = $m[2];
+	// -------------------------------------------------------------------------
+	// HTML extraction.
+	// -------------------------------------------------------------------------
 
-    libxml_use_internal_errors(true);
-    $dom = new DOMDocument();
+	/**
+	 * Extract inner HTML for a CSS class or ID selector.
+	 *
+	 * Intentionally limited to simple single-token selectors (.class or #id)
+	 * for safety and performance.
+	 *
+	 * @param string $html     Full HTML document string.
+	 * @param string $selector CSS selector (e.g. ".blog-wrap" or "#main").
+	 * @return string Extracted inner HTML, or empty string on failure.
+	 */
+	private function extract_selector_html( $html, $selector ) {
+		$selector = trim( $selector );
 
-    // Prevent DOMDocument from mangling UTF-8 badly
-    $dom->loadHTML('<?xml encoding="utf-8" ?>' . $html, LIBXML_NOWARNING | LIBXML_NOERROR);
+		if ( ! preg_match( '/^([.#])([A-Za-z0-9_-]+)$/', $selector, $m ) ) {
+			return '';
+		}
 
-    $xpath = new DOMXPath($dom);
+		$type = $m[1];
+		$name = $m[2];
 
-    if ($type === '.') {
-      $query = "//*[contains(concat(' ', normalize-space(@class), ' '), ' {$name} ')]";
-    } else {
-      $query = "//*[@id='{$name}']";
-    }
+		libxml_use_internal_errors( true );
+		$dom = new DOMDocument();
+		$dom->loadHTML( '<?xml encoding="utf-8" ?>' . $html, LIBXML_NOWARNING | LIBXML_NOERROR );
 
-    $nodes = $xpath->query($query);
-    if (!$nodes || $nodes->length === 0) return '';
+		$xpath = new DOMXPath( $dom );
 
-    $node = $nodes->item(0);
+		if ( '.' === $type ) {
+			$query = "//*[contains(concat(' ', normalize-space(@class), ' '), ' {$name} ')]";
+		} else {
+			$query = "//*[@id='{$name}']";
+		}
 
-    // Return inner HTML of the node (or outer HTML if you prefer)
-    $out = '';
-    foreach ($node->childNodes as $child) {
-      $out .= $dom->saveHTML($child);
-    }
+		$nodes = $xpath->query( $query );
+		if ( ! $nodes || 0 === $nodes->length ) {
+			return '';
+		}
 
-    return $out;
-  }
+		$node = $nodes->item( 0 );
+		$out  = '';
+		// phpcs:ignore WordPress.NamingConventions.ValidVariableName.UsedPropertyNotSnakeCase
+		foreach ( $node->childNodes as $child ) {
+			$out .= $dom->saveHTML( $child );
+		}
 
-  public function bust_all_cache() {
-    // Simple approach: bump a version key and include it in cache keys if you want.
-    // For now, we just delete known transients by pattern is not possible in WP core.
-    // Instead, lower TTL + manual bust via version option.
-    update_option('scf_cache_bust', time(), false);
+		return $out;
+	}
 
-    // Also clear term caches we created (best effort)
-    // (No pattern delete in core; leaving TTL is fine)
-  }
+	// -------------------------------------------------------------------------
+	// Cache helpers.
+	// -------------------------------------------------------------------------
 
-  public function register_vc_element() {
-    if (!defined('WPB_VC_VERSION') || !function_exists('vc_map')) return;
+	/**
+	 * Return the current cache-bust version integer stored as a WP option.
+	 *
+	 * @return int
+	 */
+	private function cache_version() {
+		return (int) get_option( 'scf_cache_bust', 0 );
+	}
 
-    vc_map([
-      'name' => 'Blog Category Filter (Salient)',
-      'base' => 'scf_blog_filter',
-      'category' => 'Content',
-      'description' => 'Filters Salient blog output on the same page.',
-      'params' => [
-        [
-          'type' => 'textfield',
-          'heading' => 'Replace selector (required)',
-          'param_name' => 'replace_selector',
-          'value' => '.blog-wrap',
-          'description' => 'Use a simple .class or #id selector that wraps the posts + pagination.',
-        ],
-        [
-          'type' => 'textfield',
-          'heading' => 'Blog Page ID (only if NOT using Posts page)',
-          'param_name' => 'page_id',
-          'value' => '',
-        ],
-        [
-          'type' => 'textfield',
-          'heading' => '"All" label',
-          'param_name' => 'all_label',
-          'value' => 'All',
-        ],
-        [
-          'type' => 'checkbox',
-          'heading' => 'Show "All" button',
-          'param_name' => 'show_all',
-          'value' => ['Yes' => '1'],
-          'std' => '1',
-        ],
-        [
-          'type' => 'textfield',
-          'heading' => 'Include term IDs',
-          'param_name' => 'include',
-        ],
-        [
-          'type' => 'textfield',
-          'heading' => 'Exclude term IDs',
-          'param_name' => 'exclude',
-        ],
-      ],
-    ]);
-  }
+	/**
+	 * Retrieve category terms from transient cache; prime the cache on miss.
+	 *
+	 * @param string $taxonomy    Taxonomy slug.
+	 * @param string $include_csv Comma-separated term IDs to include.
+	 * @param string $exclude_csv Comma-separated term IDs to exclude.
+	 * @return WP_Term[]
+	 */
+	private function get_terms_cached( $taxonomy, $include_csv, $exclude_csv ) {
+		$key    = 'scf_terms_v' . $this->cache_version() . '_' . md5( $taxonomy . '|' . $include_csv . '|' . $exclude_csv );
+		$cached = get_transient( $key );
+		if ( false !== $cached ) {
+			return $cached;
+		}
+
+		$terms_args = array(
+			'taxonomy'   => $taxonomy,
+			'hide_empty' => true,
+			'orderby'    => 'name',
+			'order'      => 'ASC',
+		);
+
+		if ( ! empty( $include_csv ) ) {
+			$terms_args['include'] = array_map( 'intval', array_filter( array_map( 'trim', explode( ',', $include_csv ) ) ) );
+		}
+		if ( ! empty( $exclude_csv ) ) {
+			$terms_args['exclude'] = array_map( 'intval', array_filter( array_map( 'trim', explode( ',', $exclude_csv ) ) ) );
+		}
+
+		$terms = get_terms( $terms_args );
+		if ( is_wp_error( $terms ) || empty( $terms ) ) {
+			set_transient( $key, array(), 300 );
+			return array();
+		}
+
+		set_transient( $key, $terms, self::TERMS_CACHE_TTL );
+		return $terms;
+	}
+
+	/**
+	 * Invalidate all plugin transients by bumping the cache-bust version.
+	 */
+	public function bust_all_cache() {
+		update_option( 'scf_cache_bust', time(), false );
+	}
+
+	// -------------------------------------------------------------------------
+	// Shortcode.
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Determine the base URL for the blog page.
+	 *
+	 * @param int $page_id Explicit page ID override (0 = auto-detect).
+	 * @return string
+	 */
+	private function get_blog_base_url( $page_id ) {
+		if ( is_home() ) {
+			$posts_page_id = (int) get_option( 'page_for_posts' );
+			return $posts_page_id ? get_permalink( $posts_page_id ) : home_url( '/' );
+		}
+		if ( is_page() ) {
+			return get_permalink( get_queried_object_id() );
+		}
+		if ( ! empty( $page_id ) ) {
+			return get_permalink( (int) $page_id );
+		}
+		return home_url( '/' );
+	}
+
+	/**
+	 * Shortcode callback: render the filter button UI.
+	 *
+	 * @param array $atts Shortcode attributes.
+	 * @return string
+	 */
+	public function shortcode_filter_ui( $atts ) {
+		wp_enqueue_script( 'scf-salient-blog-filter' );
+		wp_enqueue_style( 'scf-salient-blog-filter' );
+
+		$atts = shortcode_atts(
+			array(
+				'taxonomy'         => 'category',
+				'show_all'         => '1',
+				'all_label'        => 'All',
+				'include'          => '',
+				'exclude'          => '',
+				'replace_selector' => '.blog-wrap',
+				'page_id'          => '',
+			),
+			$atts,
+			'scf_blog_filter'
+		);
+
+		$taxonomy = sanitize_key( $atts['taxonomy'] );
+		if ( ! taxonomy_exists( $taxonomy ) ) {
+			return '';
+		}
+
+		$page_id          = (int) $atts['page_id'];
+		$replace_selector = (string) $atts['replace_selector'];
+
+		$terms = $this->get_terms_cached( $taxonomy, $atts['include'], $atts['exclude'] );
+		if ( empty( $terms ) ) {
+			return '';
+		}
+
+		$base_url = $this->get_blog_base_url( $page_id );
+
+		ob_start(); ?>
+		<div class="scf-blog-filter-ui"
+			data-base-url="<?php echo esc_url( $base_url ); ?>"
+			data-replace-selector="<?php echo esc_attr( $replace_selector ); ?>"
+			data-page-id="<?php echo esc_attr( $page_id ); ?>">
+
+		<div class="scf-blog-filter-ui__buttons"
+			role="group"
+			aria-label="<?php esc_attr_e( 'Filter by category', 'salient-category-filter' ); ?>">
+			<span aria-hidden="true"><?php esc_html_e( 'FILTER BY:', 'salient-category-filter' ); ?></span>
+			<?php if ( 1 === (int) $atts['show_all'] ) : ?>
+			<button class="scf-btn is-active" type="button" data-cat="0" aria-pressed="true"><?php echo esc_html( $atts['all_label'] ); ?></button>
+			<?php endif; ?>
+
+			<?php foreach ( $terms as $t ) : ?>
+			<button class="scf-btn" type="button" data-cat="<?php echo (int) $t->term_id; ?>" aria-pressed="false">
+				<?php echo esc_html( $t->name ); ?>
+			</button>
+			<?php endforeach; ?>
+		</div>
+
+		<div class="scf-live-status screen-reader-text" aria-live="polite" aria-atomic="true"></div>
+
+		</div>
+		<?php
+		return ob_get_clean();
+	}
+
+	// -------------------------------------------------------------------------
+	// WPBakery element.
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Register the WPBakery Visual Composer element mapping.
+	 */
+	public function register_vc_element() {
+		if ( ! defined( 'WPB_VC_VERSION' ) || ! function_exists( 'vc_map' ) ) {
+			return;
+		}
+
+		vc_map(
+			array(
+				'name'        => 'Blog Category Filter (Salient)',
+				'base'        => 'scf_blog_filter',
+				'category'    => 'Content',
+				'description' => 'Filters Salient blog output on the same page.',
+				'params'      => array(
+					array(
+						'type'        => 'textfield',
+						'heading'     => 'Replace selector (required)',
+						'param_name'  => 'replace_selector',
+						'value'       => '.blog-wrap',
+						'description' => 'Use a simple .class or #id selector that wraps the posts + pagination.',
+					),
+					array(
+						'type'       => 'textfield',
+						'heading'    => 'Blog Page ID (only if NOT using Posts page)',
+						'param_name' => 'page_id',
+						'value'      => '',
+					),
+					array(
+						'type'       => 'textfield',
+						'heading'    => '"All" label',
+						'param_name' => 'all_label',
+						'value'      => 'All',
+					),
+					array(
+						'type'       => 'checkbox',
+						'heading'    => 'Show "All" button',
+						'param_name' => 'show_all',
+						'value'      => array( 'Yes' => '1' ),
+						'std'        => '1',
+					),
+					array(
+						'type'       => 'textfield',
+						'heading'    => 'Include term IDs',
+						'param_name' => 'include',
+					),
+					array(
+						'type'       => 'textfield',
+						'heading'    => 'Exclude term IDs',
+						'param_name' => 'exclude',
+					),
+				),
+			)
+		);
+	}
 }
 
 new SCF_Salient_Blog_Filter();
 
-if (class_exists('WPBakeryShortCode')) {
-  class WPBakeryShortCode_scf_blog_filter extends WPBakeryShortCode {}
+if ( class_exists( 'WPBakeryShortCode' ) ) {
+	/**
+	 * WPBakery shortcode class for scf_blog_filter.
+	 *
+	 * The class name follows WPBakery's required naming convention
+	 * (WPBakeryShortCode_{shortcode_base}) and cannot be changed.
+	 *
+	 * @package Salient_Category_Filter
+	 */
+	// phpcs:ignore Generic.Files.OneObjectStructurePerFile.MultipleFound, WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedClassFound
+	class WPBakeryShortCode_scf_blog_filter extends WPBakeryShortCode {} // phpcs:ignore WordPress.NamingConventions.ValidClassName.NotCamelCaps
 }
+
+// ---------------------------------------------------------------------------
+// Lifecycle hooks.
+// ---------------------------------------------------------------------------
+
+/**
+ * Plugin activation callback.
+ */
+function scf_activate() {}
+
+/**
+ * Plugin deactivation callback.
+ */
+function scf_deactivate() {}
+
+register_activation_hook( __FILE__, 'scf_activate' );
+register_deactivation_hook( __FILE__, 'scf_deactivate' );
+
+if ( ! function_exists( 'scf_uninstall' ) ) {
+	/**
+	 * Plugin uninstall callback: remove persistent options.
+	 */
+	function scf_uninstall() {
+		delete_option( 'scf_cache_bust' );
+	}
+}
+register_uninstall_hook( __FILE__, 'scf_uninstall' );
