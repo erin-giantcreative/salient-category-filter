@@ -303,41 +303,14 @@ class SCF_Salient_Blog_Filter {
 			);
 		}
 
-		// Build the loopback URL with filter state.
-		$url = add_query_arg( array(), $base_url );
+		// Render the blog template directly in PHP — no HTTP loopback needed.
+		$full_html = $this->render_blog_html_internal( $cat_id, $page_id );
 
-		if ( $cat_id > 0 ) {
-			$url = add_query_arg( self::QV, $cat_id, $url );
-		} else {
-			$url = remove_query_arg( self::QV, $url );
+		if ( ! $full_html ) {
+			return new WP_Error( 'render_failed', 'Could not render blog template.', array( 'status' => 500 ) );
 		}
 
-		if ( $page_id > 0 ) {
-			$url = add_query_arg( 'scf_page_id', $page_id, $url );
-		} else {
-			$url = remove_query_arg( 'scf_page_id', $url );
-		}
-
-		$resp = wp_remote_get(
-			$url,
-			array(
-				'timeout'     => 10,
-				'sslverify'   => ! ( defined( 'WP_DEBUG' ) && WP_DEBUG ),
-				'httpversion' => '1.1',
-				'headers'     => array( 'X-SCF-Request' => '1' ),
-			)
-		);
-
-		if ( is_wp_error( $resp ) ) {
-			return new WP_Error( 'http_error', $resp->get_error_message(), array( 'status' => 500 ) );
-		}
-
-		$body = wp_remote_retrieve_body( $resp );
-		if ( ! $body ) {
-			return new WP_Error( 'empty_body', 'Empty response body.', array( 'status' => 500 ) );
-		}
-
-		$extracted = $this->extract_selector_html( $body, $replace_selector );
+		$extracted = $this->extract_selector_html( $full_html, $replace_selector );
 		if ( ! $extracted ) {
 			return new WP_Error(
 				'selector_not_found',
@@ -413,6 +386,64 @@ class SCF_Salient_Blog_Filter {
 	// -------------------------------------------------------------------------
 
 	/**
+	 * Render the blog page HTML directly using WordPress template loading,
+	 * bypassing any HTTP loopback request entirely.
+	 *
+	 * Overrides the global WP_Query for the duration of the include so that
+	 * the theme template sees the correct posts, then restores all globals.
+	 *
+	 * @param int $cat_id  Category ID (0 = all posts).
+	 * @param int $page_id Page ID for same-page blog embed (0 = posts page).
+	 * @return string Full HTML output of the rendered template.
+	 */
+	private function render_blog_html_internal( $cat_id, $page_id ) {
+		global $wp_query, $wp_the_query, $post;
+
+		$query_args = array(
+			'post_type'      => 'post',
+			'posts_per_page' => (int) get_option( 'posts_per_page' ),
+			'paged'          => 1,
+		);
+		if ( $cat_id > 0 ) {
+			$query_args['cat'] = $cat_id;
+		}
+
+		// Save globals.
+		$orig_query     = $wp_query;
+		$orig_the_query = $wp_the_query;
+		$orig_post      = $post;
+
+		// Override with the filtered query.
+		$new_query          = new WP_Query( $query_args );
+		$new_query->is_home = ( 0 === $cat_id );
+		$wp_query           = $new_query;  // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
+		$wp_the_query       = $new_query;  // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
+
+		// Locate the appropriate template file.
+		if ( $page_id > 0 ) {
+			$templates = array( 'page-' . $page_id . '.php', 'page.php' );
+		} else {
+			$templates = array( 'home.php', 'index.php' );
+		}
+		$template_file = locate_template( $templates );
+
+		// Capture the full page output; we'll extract the selector we need from it.
+		ob_start();
+		if ( $template_file ) {
+			( static function ( $f ) { include $f; } )( $template_file );
+		}
+		$html = ob_get_clean();
+
+		// Restore globals.
+		$wp_query     = $orig_query;     // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
+		$wp_the_query = $orig_the_query; // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
+		$post         = $orig_post;      // phpcs:ignore WordPress.WP.GlobalVariablesOverride.Prohibited
+		wp_reset_postdata();
+
+		return (string) $html;
+	}
+
+	/**
 	 * Return the current cache-bust version integer stored as a WP option.
 	 *
 	 * @return int
@@ -455,6 +486,12 @@ class SCF_Salient_Blog_Filter {
 			set_transient( $key, array(), 300 );
 			return array();
 		}
+
+		// Exclude specific categories by name.
+		$excluded_names = array( 'Landing Page' );
+		$terms          = array_values( array_filter( $terms, function( $t ) use ( $excluded_names ) {
+			return ! in_array( $t->name, $excluded_names, true );
+		} ) );
 
 		set_transient( $key, $terms, self::TERMS_CACHE_TTL );
 		return $terms;

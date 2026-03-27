@@ -6,6 +6,9 @@ jQuery(
 			return;
 		}
 
+		// In-memory cache: key = "catId_pageId", value = html string.
+		const htmlCache = new Map();
+
 		function hydrateNectarLazy($scope) {
 			// <img class="nectar-lazy" data-nectar-img-src="...">
 			$scope.find( 'img.nectar-lazy' ).each(
@@ -75,10 +78,19 @@ jQuery(
 		/**
 		 * Request blog HTML via the REST API endpoint (GET /wp-json/scf/v1/blog-html).
 		 * Falls back to the legacy admin-ajax POST if restUrl is not available.
+		 * Returns a jQuery Deferred — resolved with { html, cached } shape.
 		 */
 		function requestBlogHtml(baseUrl, replaceSelector, catId, pageId) {
+			const cacheKey = catId + '_' + pageId;
+
+			if (htmlCache.has( cacheKey )) {
+				return $.Deferred().resolve( { html: htmlCache.get( cacheKey ), cached: true } ).promise();
+			}
+
+			let req;
+
 			if (SCF_BLOG_FILTER.restUrl) {
-				return $.ajax(
+				req = $.ajax(
 					{
 						url:      SCF_BLOG_FILTER.restUrl,
 						type:     'GET',
@@ -91,24 +103,46 @@ jQuery(
 						}
 					}
 				);
+			} else {
+				// Legacy fallback for environments where REST API is unavailable
+				req = $.ajax(
+					{
+						url:      SCF_BLOG_FILTER.ajaxUrl,
+						type:     'POST',
+						dataType: 'json',
+						data: {
+							action:           'scf_get_blog_html',
+							nonce:            SCF_BLOG_FILTER.nonce,
+							base_url:         baseUrl,
+							replace_selector: replaceSelector,
+							cat_id:           catId,
+							page_id:          pageId
+						}
+					}
+				);
 			}
 
-			// Legacy fallback for environments where REST API is unavailable
-			return $.ajax(
-				{
-					url:      SCF_BLOG_FILTER.ajaxUrl,
-					type:     'POST',
-					dataType: 'json',
-					data: {
-						action:           'scf_get_blog_html',
-						nonce:            SCF_BLOG_FILTER.nonce,
-						base_url:         baseUrl,
-						replace_selector: replaceSelector,
-						cat_id:           catId,
-						page_id:          pageId
+			// Populate the cache on success so subsequent calls are instant.
+			req.done(
+				function (res) {
+					const html = extractHtml( res );
+					if (html !== null) {
+						htmlCache.set( cacheKey, html );
 					}
 				}
 			);
+
+			return req;
+		}
+
+		function extractHtml(res) {
+			if (res && typeof res.html === 'string') {
+				return res.html;
+			}
+			if (res && res.success && res.data && typeof res.data.html === 'string') {
+				return res.data.html;
+			}
+			return null;
 		}
 
 		function replaceContainer(replaceSelector, html) {
@@ -124,6 +158,15 @@ jQuery(
 			hydrateNectarLazy( $target );
 
 			return true;
+		}
+
+		// Silently pre-fetch a category and store it in the cache.
+		function prefetch(baseUrl, replaceSelector, catId, pageId) {
+			const cacheKey = catId + '_' + pageId;
+			if (htmlCache.has( cacheKey )) {
+				return;
+			}
+			requestBlogHtml( baseUrl, replaceSelector, catId, pageId );
 		}
 
 		$( document ).on(
@@ -144,30 +187,31 @@ jQuery(
 				const pageId          = parseInt( $ui.data( 'page-id' ), 10 ) || 0;
 				const catId           = parseInt( $btn.data( 'cat' ), 10 ) || 0;
 
-				$ui.addClass( 'is-loading' );
 				$ui.find( '.scf-btn' ).removeClass( 'is-active' ).attr( 'aria-pressed', 'false' );
 				$btn.addClass( 'is-active' ).attr( 'aria-pressed', 'true' );
 
+				// If the response is already cached, swap instantly without showing the loading state.
+				const cacheKey = catId + '_' + pageId;
+				if (htmlCache.has( cacheKey )) {
+					replaceContainer( replaceSelector, htmlCache.get( cacheKey ) );
+					setUrlState( baseUrl, catId, pageId );
+					$ui.find( '.scf-live-status' ).text( $btn.text().trim() );
+					return;
+				}
+
+				$ui.addClass( 'is-loading' );
 				const $target = $( replaceSelector ).first();
 				$target.addClass( 'is-loading' ).attr( 'aria-busy', 'true' );
 
 				requestBlogHtml( baseUrl, replaceSelector, catId, pageId )
 				.done(
 					function (res) {
-						// REST API returns { html: '...', cached: bool } at the top level.
-						// Legacy admin-ajax returns { success: true, data: { html: '...', cached: bool } }.
-						const html = (res && typeof res.html === 'string')
-						? res.html
-						: (res && res.success && res.data && typeof res.data.html === 'string')
-						? res.data.html
-						: null;
+						const html = extractHtml( res );
 
 						if (html !== null) {
 							replaceContainer( replaceSelector, html );
 							setUrlState( baseUrl, catId, pageId );
-							// Announce the update to screen readers
-							const label = $btn.text().trim();
-							$ui.find( '.scf-live-status' ).text( label || '' );
+							$ui.find( '.scf-live-status' ).text( $btn.text().trim() );
 						} else {
 							console.warn( 'Unexpected SCF response', res );
 						}
@@ -184,6 +228,23 @@ jQuery(
 						$( replaceSelector ).first().removeClass( 'is-loading' ).attr( 'aria-busy', 'false' );
 					}
 				);
+			}
+		);
+
+		// Prefetch on hover so the response is often ready before the click lands.
+		$( document ).on(
+			'mouseenter',
+			'.scf-blog-filter-ui .scf-btn',
+			function () {
+				const $btn = $( this );
+				const $ui  = $btn.closest( '.scf-blog-filter-ui' );
+
+				const baseUrl         = $ui.data( 'base-url' );
+				const replaceSelector = $ui.data( 'replace-selector' );
+				const pageId          = parseInt( $ui.data( 'page-id' ), 10 ) || 0;
+				const catId           = parseInt( $btn.data( 'cat' ), 10 ) || 0;
+
+				prefetch( baseUrl, replaceSelector, catId, pageId );
 			}
 		);
 
